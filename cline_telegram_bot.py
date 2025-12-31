@@ -9,10 +9,14 @@ import re
 from collections import deque
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from dotenv import load_dotenv
 
-# Configuration
-TELEGRAM_BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"
-AUTHORIZED_USER_ID = 123456789
+# Load environment variables
+load_dotenv()
+
+# Configuration from environment variables
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+AUTHORIZED_USER_ID = int(os.getenv("AUTHORIZED_USER_ID", "0"))
 CLINE_COMMAND = ["cline"]
 
 class ClineTelegramBot:

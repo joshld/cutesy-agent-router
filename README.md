@@ -36,9 +36,10 @@ python cline_telegram_bot.py
 
 ## Configuration
 
-Create a `.env` file with your Telegram bot token:
+Create a `.env` file with your Telegram bot token and authorized user ID:
 ```
 TELEGRAM_BOT_TOKEN=your_bot_token_here
+AUTHORIZED_USER_ID=your_telegram_user_id
 ```
 
 ## Development
