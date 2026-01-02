@@ -976,7 +976,7 @@ async def output_monitor(bot_instance, application, chat_id):
                     # All other filtering logic uses remaining_output
                     normalized_output = ' '.join(remaining_output.split())
                     message_hash = hash(normalized_output)  # ADD THIS LINE
-                    is_repetitive_ui = ui_score >= 2 and '/plan or /act' in remaining_output
+                    is_repetitive_ui = ui_score >= 1 and '/plan or /act' in remaining_output
                     is_duplicate = message_hash in recent_messages  # Now defined
                     is_cline_response = '###' in remaining_output
 
@@ -986,7 +986,7 @@ async def output_monitor(bot_instance, application, chat_id):
                         should_filter = True
                     elif is_cline_response:
                         should_filter = False  # Allow Cline responses
-                    elif '/plan or /act to switch modes' in remaining_output and ui_score >= 1:  # FIX: use remaining_output
+                    elif is_repetitive_ui:
                         should_filter = True  # Repetitive spam
                     elif ui_score >= 2 and len(remaining_output.strip()) <= 50:
                         should_filter = True  # Short UI junk
