@@ -1069,7 +1069,11 @@ def main():
     debug_log(DEBUG_DEBUG, "Message handlers added")
 
     try:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Fallback for when no loop is running
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
     except Exception as e:
         debug_log(DEBUG_ERROR, "Failed to create output monitor task", 
                  error_type=type(e).__name__, error=str(e))
