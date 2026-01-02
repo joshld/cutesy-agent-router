@@ -402,11 +402,9 @@ class ClineTelegramBot:
         # Filter out Cline CLI UI prompts and repetitive UI elements
         ui_indicators = [
             '╭', '╰', '│', '┃', '╮', '╯',
-            'cline cli preview',
+            'cline cli',
             '/plan or /act',
             'alt+enter',
-            'openrouter/xiaomi',
-            '~/cline-workspace',
             'enter submit',
             'new line',
             'open editor',
@@ -414,11 +412,8 @@ class ClineTelegramBot:
         
         ui_score = sum(1 for indicator in ui_indicators if indicator in clean_output)
         lines = clean_output.split('\n')
-        empty_lines = sum(1 for line in lines if not line.strip())
-        
-        is_welcome_screen = 'cline cli preview' in clean_output and 'openrouter/xiaomi' in clean_output
-        is_ui_heavy = ui_score >= 2 and not is_welcome_screen
-        is_ui_heavy = is_ui_heavy or (len(lines) > 0 and empty_lines / len(lines) > 0.5)
+
+        is_welcome_screen = 'cline cli' in clean_output
         is_box_char = clean_output.strip() in ['╭', '╰', '│', '┃', '╮', '╯']
         is_box_line = bool(re.match(r'^[\s│┃╭╰╮╯]+$', clean_output.strip()))
         
@@ -947,7 +942,7 @@ async def output_monitor(bot_instance, application, chat_id):
                 if remaining_output:
                     # Use REMAINING_OUTPUT for filtering (not clean_output)
                     is_welcome_screen = 'cline cli' in remaining_output
-                    ui_indicators = ['╭', '╰', '│', '┃', 'cline cli preview', '/plan or /act']
+                    ui_indicators = ['╭', '╰', '│', '┃', '/plan or /act']
                     ui_score = sum(1 for indicator in ui_indicators if indicator in remaining_output)
                     
                     # All other filtering logic uses remaining_output
