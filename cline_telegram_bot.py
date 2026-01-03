@@ -35,6 +35,12 @@ DEBUG_INFO, DEBUG_WARN, DEBUG_ERROR, DEBUG_DEBUG = "INFO", "WARN", "ERROR", "DEB
 class ClineTelegramBot:
     def __init__(self):
         debug_log(DEBUG_INFO, "ClineTelegramBot.__init__ called")
+        
+        # Thread synchronization
+        self.state_lock = threading.RLock()  # Reentrant lock for state changes
+        self.output_queue_lock = threading.Lock()  # Separate lock for queue
+        self.command_lock = threading.Lock()  # Lock for PTY writes
+        
         self.master_fd = None
         self.slave_fd = None
         self.process = None
@@ -51,6 +57,10 @@ class ClineTelegramBot:
         self.application = None
         self.last_chat_id = None
         self._output_monitor_started = False
+        
+        # Health monitoring
+        self.output_reader_healthy = False
+        self.last_reader_heartbeat = time.time()
 
     def _find_child_processes(self, parent_pid):
         """Find all child processes of a given PID"""
@@ -123,93 +133,106 @@ class ClineTelegramBot:
         """Comprehensive cleanup of all resources"""
         debug_log(DEBUG_INFO, "Performing comprehensive cleanup")
         self.stop_reading = True
+        
         if self.process:
             self._kill_process_tree(self.process.pid)
             self.process = None
         self._ensure_session_clean()
+        
         self.master_fd = self._close_fd(self.master_fd, "master_fd")
         self.slave_fd = self._close_fd(self.slave_fd, "slave_fd")
         self.is_running = False
         self.session_active = False
         self.child_pids.clear()
-        self.output_queue.clear()
+        
+        with self.output_queue_lock:
+            self.output_queue.clear()
+        
         debug_log(DEBUG_DEBUG, "Cleanup complete")
 
     def start_pty_session(self, application=None):
         """Start PTY session with proper process management"""
         debug_log(DEBUG_INFO, "start_pty_session called")
         
-        if self.session_active:
-            debug_log(DEBUG_WARN, "Session already active")
-            return False
-        
-        self._ensure_session_clean()
-        
-        try:
-            self.master_fd, self.slave_fd = pty.openpty()
-            env = dict(os.environ, TERM='xterm-256color', COLUMNS='80', LINES='24')
+        with self.state_lock:
+            if self.session_active:
+                debug_log(DEBUG_WARN, "Session already active")
+                return False
             
-            self.process = subprocess.Popen(
-                CLINE_COMMAND,
-                stdin=self.slave_fd, stdout=self.slave_fd, stderr=self.slave_fd,
-                preexec_fn=os.setsid, env=env
-            )
+            self._ensure_session_clean()
             
-            self.child_pids = {self.process.pid}
-            time.sleep(0.5)
-            
-            if self.process.poll() is not None:
-                raise RuntimeError("Cline process died immediately")
-
-            self.is_running = True
-            self.session_active = True
-            self.stop_reading = False
-            self.output_thread = threading.Thread(target=self._output_reader, daemon=True)
-            self.output_thread.start()
-
-            debug_log(DEBUG_INFO, "PTY session started successfully")
-            time.sleep(1)
-            
-            if application:
-                async def notify():
-                    await self._send_notification(
-                        AUTHORIZED_USER_ID,
-                        "🟢 **Cline Session Started**\n\nPTY session is now active and ready for commands.",
-                        "Session start notification sent",
-                        "Failed to send session start notification"
-                    )
+            try:
+                self.master_fd, self.slave_fd = pty.openpty()
+                env = dict(os.environ, TERM='xterm-256color', COLUMNS='80', LINES='24')
                 
-                try:
-                    loop = asyncio.get_event_loop()
-                    loop.create_task(notify())
-                except Exception as e:
-                    debug_log(DEBUG_ERROR, "Failed to schedule notification", error=str(e))
-            
-            return True
-        except Exception as e:
-            debug_log(DEBUG_ERROR, "Failed to start PTY session", error=str(e))
-            self._cleanup_resources()
-            return False
+                self.process = subprocess.Popen(
+                    CLINE_COMMAND,
+                    stdin=self.slave_fd, stdout=self.slave_fd, stderr=self.slave_fd,
+                    preexec_fn=os.setsid, env=env
+                )
+                
+                self.child_pids = {self.process.pid}
+                time.sleep(0.5)
+                
+                if self.process.poll() is not None:
+                    raise RuntimeError("Cline process died immediately")
+
+                self.is_running = True
+                self.session_active = True
+                self.stop_reading = False
+                self.output_reader_healthy = False
+                self.output_thread = threading.Thread(target=self._output_reader, daemon=True)
+                self.output_thread.start()
+
+                debug_log(DEBUG_INFO, "PTY session started successfully")
+                time.sleep(1)
+                
+                if application:
+                    async def notify():
+                        await self._send_notification(
+                            AUTHORIZED_USER_ID,
+                            "🟢 **Cline Session Started**\n\nPTY session is now active and ready for commands.",
+                            "Session start notification sent",
+                            "Failed to send session start notification"
+                        )
+                    
+                    try:
+                        loop = asyncio.get_event_loop()
+                        loop.create_task(notify())
+                    except Exception as e:
+                        debug_log(DEBUG_ERROR, "Failed to schedule notification", error=str(e))
+                
+                return True
+            except Exception as e:
+                debug_log(DEBUG_ERROR, "Failed to start PTY session", error=str(e))
+                self._cleanup_resources()
+                return False
 
     def stop_pty_session(self, application=None):
         """Stop PTY session with comprehensive cleanup"""
         debug_log(DEBUG_INFO, "stop_pty_session called")
         
-        if not self.session_active:
-            return
+        with self.state_lock:
+            if not self.session_active:
+                return
 
-        self.stop_reading = True
-        self.session_active = False
+            self.stop_reading = True
+            self.session_active = False
 
-        if self.process:
-            self._kill_process_tree(self.process.pid)
-            self._ensure_session_clean()
+            if self.process:
+                self._kill_process_tree(self.process.pid)
+                self._ensure_session_clean()
 
-        if self.output_thread and self.output_thread.is_alive():
-            self.output_thread.join(timeout=2.0)
+            # Wait for reader thread to notice stop_reading flag
+            time.sleep(0.3)
 
-        self._cleanup_resources()
-        self._output_monitor_started = False
+            if self.output_thread and self.output_thread.is_alive():
+                self.output_thread.join(timeout=2.0)
+                if self.output_thread.is_alive():
+                    debug_log(DEBUG_WARN, "Output thread did not exit cleanly")
+
+            self._cleanup_resources()
+            self._output_monitor_started = False
         
         if application:
             async def notify():
@@ -247,8 +270,13 @@ class ClineTelegramBot:
         read_count = 0
         error_count = 0
         
+        self.output_reader_healthy = True
+        self.last_reader_heartbeat = time.time()
+        
         while not self.stop_reading and self.is_running:
             try:
+                self.last_reader_heartbeat = time.time()
+                
                 ready, _, _ = select.select([self.master_fd], [], [], 0.1)
                 if ready:
                     data = os.read(self.master_fd, 4096)
@@ -256,18 +284,26 @@ class ClineTelegramBot:
                         output = data.decode('utf-8', errors='replace')
                         read_count += 1
                         self._process_output(output)
+                        error_count = 0  # Reset error count on success
                     else:
                         debug_log(DEBUG_WARN, "EOF received from PTY")
                         break
                 else:
                     time.sleep(0.05)
-            except Exception as e:
+            except OSError as e:
                 error_count += 1
                 if error_count > 10:
-                    debug_log(DEBUG_ERROR, "Too many errors, stopping output reader")
+                    debug_log(DEBUG_ERROR, "Too many read errors, stopping output reader", error=str(e))
+                    break
+                time.sleep(0.1)
+            except Exception as e:
+                error_count += 1
+                debug_log(DEBUG_ERROR, "Unexpected error in output reader", error=str(e))
+                if error_count > 10:
                     break
                 time.sleep(0.1)
 
+        self.output_reader_healthy = False
         debug_log(DEBUG_INFO, "Output reader thread stopped", total_reads=read_count, total_errors=error_count)
 
     def _process_output(self, output):
@@ -294,74 +330,81 @@ class ClineTelegramBot:
 
         for pattern in prompt_patterns:
             if re.search(pattern, clean_output, re.IGNORECASE):
-                self.waiting_for_input = True
-                self.input_prompt = clean_output.strip()
-                self.last_prompt_time = time.time()
+                with self.state_lock:
+                    self.waiting_for_input = True
+                    self.input_prompt = clean_output.strip()
+                    self.last_prompt_time = time.time()
                 debug_log(DEBUG_INFO, "Interactive prompt detected", pattern=pattern)
                 break
 
         if not self.waiting_for_input and re.search(r'[\[\(].*[\]\)]\s*$', clean_output.strip()):
-            self.waiting_for_input = True
-            self.input_prompt = clean_output.strip()
+            with self.state_lock:
+                self.waiting_for_input = True
+                self.input_prompt = clean_output.strip()
 
-        self.output_queue.append(clean_output)
-        if len(self.output_queue) > 100:
-            self.output_queue.popleft()
-            debug_log(DEBUG_WARN, "Queue overflow, removing oldest entry")
+        with self.output_queue_lock:
+            self.output_queue.append(clean_output)
+            if len(self.output_queue) > 100:
+                self.output_queue.popleft()
+                debug_log(DEBUG_WARN, "Queue overflow, removing oldest entry")
 
     def send_command(self, command):
         """Send command to Cline"""
         debug_log(DEBUG_INFO, "send_command called", command=command)
         
-        if not self.is_running:
-            debug_log(DEBUG_ERROR, "Cannot send command - PTY not running")
-            return "Error: PTY session not running"
+        with self.command_lock:
+            if not self.is_running:
+                debug_log(DEBUG_ERROR, "Cannot send command - PTY not running")
+                return "Error: PTY session not running"
 
-        current_time = time.time()
-        if self.waiting_for_input and (current_time - self.last_prompt_time) > 30:
-            debug_log(DEBUG_INFO, "Resetting stale waiting_for_input state")
-            self.waiting_for_input = False
-            self.input_prompt = ""
+            current_time = time.time()
+            with self.state_lock:
+                if self.waiting_for_input and (current_time - self.last_prompt_time) > 30:
+                    debug_log(DEBUG_INFO, "Resetting stale waiting_for_input state")
+                    self.waiting_for_input = False
+                    self.input_prompt = ""
 
-        try:
-            self.waiting_for_input = False
-            self.input_prompt = ""
-            
-            os.write(self.master_fd, f"{command}\r\n".encode())
-            time.sleep(0.2)
-            self.current_command = command
-            
-            debug_log(DEBUG_INFO, "Command sent successfully", command=command)
-            return "Command sent"
-        except Exception as e:
-            debug_log(DEBUG_ERROR, "Failed to send command", command=command, error=str(e))
-            return f"Error sending command: {e}"
+                try:
+                    self.waiting_for_input = False
+                    self.input_prompt = ""
+                    
+                    os.write(self.master_fd, f"{command}\r\n".encode())
+                    time.sleep(0.2)
+                    self.current_command = command
+                    
+                    debug_log(DEBUG_INFO, "Command sent successfully", command=command)
+                    return "Command sent"
+                except Exception as e:
+                    debug_log(DEBUG_ERROR, "Failed to send command", command=command, error=str(e))
+                    return f"Error sending command: {e}"
 
     def get_pending_output(self, max_length=4000):
         """Get accumulated output"""
-        if not self.output_queue:
-            return None
+        with self.output_queue_lock:
+            if not self.output_queue:
+                return None
 
-        combined = ""
-        chunks_used = 0
-        
-        while self.output_queue and len(combined) < max_length:
-            chunk = self.output_queue.popleft()
-            if len(combined + chunk) > max_length:
-                self.output_queue.appendleft(chunk)
-                break
-            combined += chunk
-            chunks_used += 1
+            combined = ""
+            chunks_used = 0
+            
+            while self.output_queue and len(combined) < max_length:
+                chunk = self.output_queue.popleft()
+                if len(combined + chunk) > max_length:
+                    self.output_queue.appendleft(chunk)
+                    break
+                combined += chunk
+                chunks_used += 1
 
-        result = combined.strip() if combined else None
-        debug_log(DEBUG_DEBUG, "Output prepared", chunks_used=chunks_used, final_length=len(result) if result else 0)
-        return result
+            result = combined.strip() if combined else None
+            debug_log(DEBUG_DEBUG, "Output prepared", chunks_used=chunks_used, final_length=len(result) if result else 0)
+            return result
 
     async def _ensure_session_active(self, update: Update) -> bool:
         """Check if session is active"""
-        if not self.session_active:
-            await update.message.reply_text("❌ No active session. Use /start first")
-            return False
+        with self.state_lock:
+            if not self.session_active:
+                await update.message.reply_text("❌ No active session. Use /start first")
+                return False
         return True
 
     async def _command_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
@@ -382,9 +425,12 @@ class ClineTelegramBot:
 
     async def _start(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
         """Handle /start"""
-        if self.session_active:
-            await update.message.reply_text("ℹ️ Cline session already running")
-            return
+        with self.state_lock:
+            if self.session_active:
+                await update.message.reply_text("ℹ️ Cline session already running")
+                return
+        
+        chat_id = update.effective_chat.id  # Capture immediately
         
         if self.start_pty_session(self.application):
             await update.message.reply_text(
@@ -396,7 +442,7 @@ class ClineTelegramBot:
             if not self._output_monitor_started:
                 try:
                     loop = asyncio.get_event_loop()
-                    loop.create_task(output_monitor(self, self.application, self.last_chat_id))
+                    loop.create_task(output_monitor(self, self.application, chat_id))
                     self._output_monitor_started = True
                     debug_log(DEBUG_DEBUG, "Output monitor task created")
                 except Exception as e:
@@ -411,20 +457,28 @@ class ClineTelegramBot:
 
     async def _status(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
         """Handle /status"""
-        status = "🟢 Running" if self.session_active else "🔴 Stopped"
-        waiting = " (waiting for input)" if self.waiting_for_input else ""
-        await update.message.reply_text(f"Status: {status}{waiting}")
+        with self.state_lock:
+            status = "🟢 Running" if self.session_active else "🔴 Stopped"
+            waiting = " (waiting for input)" if self.waiting_for_input else ""
+            reader_status = "✓" if self.output_reader_healthy else "✗"
+        await update.message.reply_text(f"Status: {status}{waiting}\nReader: {reader_status}")
 
     async def _cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
-        """Handle /cancel"""
+        """Handle /cancel - Send Ctrl+C to cancel current task"""
         if not await self._ensure_session_active(update):
             return
-        await self._send_message(update.effective_chat.id, "🛑 Cancel signal sent")
-        self.send_command("\x03")
-        await asyncio.sleep(0.5)
-        output = self.get_pending_output()
-        if output:
-            await self._send_message(update.effective_chat.id, output)
+        
+        await self._send_message(update.effective_chat.id, "🛑 Cancelling current task...")
+        
+        with self.command_lock:
+            try:
+                # Send Ctrl+C (0x03) directly to PTY
+                bytes_written = os.write(self.master_fd, b"\x03")
+                debug_log(DEBUG_INFO, "Ctrl+C sent to PTY", bytes_written=bytes_written)
+            except Exception as e:
+                debug_log(DEBUG_ERROR, "Failed to send Ctrl+C", error=str(e))
+                await self._send_message(update.effective_chat.id, f"❌ Failed to send cancel signal: {e}")
+                return
 
     async def _mode_switch(self, update: Update, context: ContextTypes.DEFAULT_TYPE, cmd: str):
         """Handle /plan and /act"""
@@ -453,7 +507,10 @@ class ClineTelegramBot:
             return
 
         # Handle interactive input
-        if self.waiting_for_input:
+        with self.state_lock:
+            waiting = self.waiting_for_input
+        
+        if waiting:
             debug_log(DEBUG_INFO, "Processing interactive input")
             self.send_command(message_text)
             await asyncio.sleep(0.5)
@@ -463,7 +520,10 @@ class ClineTelegramBot:
             return
 
         # Regular commands
-        if self.session_active:
+        with self.state_lock:
+            active = self.session_active
+        
+        if active:
             debug_log(DEBUG_INFO, "Processing regular command", command=message_text)
             self.send_command(message_text)
             await self._send_message(update.effective_chat.id, f"📤 Message sent: {message_text}")
@@ -489,7 +549,10 @@ async def output_monitor(bot_instance, application, chat_id):
             await asyncio.sleep(2)
             continue
         
-        if bot_instance.session_active and bot_instance.output_queue:
+        with bot_instance.state_lock:
+            active = bot_instance.session_active
+        
+        if active and bot_instance.output_queue:
             output = bot_instance.get_pending_output()
             if output:
                 clean_output = strip_ansi_codes(output)
@@ -567,8 +630,9 @@ def main():
 
     def signal_handler(signum, frame):
         debug_log(DEBUG_INFO, f"Received signal {signum}, shutting down")
-        if bot.session_active:
-            bot.stop_pty_session()
+        with bot.state_lock:
+            if bot.session_active:
+                bot.stop_pty_session()
         import sys
         sys.exit(0)
 
