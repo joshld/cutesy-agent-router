@@ -52,25 +52,37 @@ python3 scripts/quick_start.py logs
 ```
 
 ### `start_bot.sh`
-**Bash-based daemon script for basic process management.**
+**Bash-based daemon script with optional auto-restart monitoring.**
 
 Features:
-- Simple background process management
+- Background process management
 - PID file tracking
-- Basic status checking
-- Manual control only
+- Status checking and logging
+- Auto-restart monitoring mode
+- Manual and automated control
 
 Usage:
 ```bash
-# Start bot
+# Auto-restart mode (recommended for production)
+./scripts/start_bot.sh monitor
+
+# Manual control
 ./scripts/start_bot.sh start
-
-# Stop bot
 ./scripts/start_bot.sh stop
+./scripts/start_bot.sh restart
 
-# Check status
+# Monitoring and logs
 ./scripts/start_bot.sh status
+./scripts/start_bot.sh logs
+./scripts/start_bot.sh tail
 ```
+
+**Auto-restart mode:**
+- Monitors bot every 10 seconds
+- Automatically restarts if bot crashes
+- 30-second delay between restart attempts
+- Limits to 10 restart attempts to prevent loops
+- Press Ctrl+C to stop monitoring
 
 ### `cline-bot.service`
 **Systemd service file for production deployment.**
@@ -138,8 +150,9 @@ sudo systemctl start bot-healthcheck.timer
 | Method | Use Case | Auto-restart | Terminal Independent | Production Ready |
 |--------|----------|-------------|-------------------|-------------------|
 | `quick_start.py monitor` | Development/Testing | ✅ | ✅ | ⚠️ Good for dev |
-| `start_bot.sh` | Simple automation | ❌ | ✅ | ❌ Basic |
-| `systemd service` | Production deployment | ✅ | ✅ | ✅ Enterprise |
+| `start_bot.sh monitor` | Simple production | ✅ | ✅ | ⚠️ Good for simple |
+| `start_bot.sh` | Manual control | ❌ | ✅ | ❌ Basic |
+| `systemd service` | Enterprise deployment | ✅ | ✅ | ✅ Enterprise |
 
 ## Log Files
 

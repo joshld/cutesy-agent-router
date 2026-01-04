@@ -125,6 +125,56 @@ restart_bot() {
     start_bot
 }
 
+# Function to auto-restart bot (monitor and restart if crashed)
+auto_restart_bot() {
+    local restart_count=0
+    local max_restarts=10
+    local restart_delay=30
+
+    echo -e "${GREEN}Starting auto-restart mode...${NC}"
+    echo "Bot will be automatically restarted if it crashes"
+    echo "Press Ctrl+C to stop monitoring"
+
+    # Start the bot initially
+    if ! start_bot; then
+        echo -e "${RED}Failed to start bot initially. Exiting auto-restart mode.${NC}"
+        return 1
+    fi
+
+    # Monitor loop
+    while true; do
+        sleep 10  # Check every 10 seconds
+
+        if ! is_running; then
+            restart_count=$((restart_count + 1))
+
+            if [ $restart_count -gt $max_restarts ]; then
+                echo -e "${RED}Bot has crashed $max_restarts times. Stopping auto-restart mode.${NC}"
+                return 1
+            fi
+
+            echo -e "${YELLOW}Bot crashed (attempt $restart_count/$max_restarts). Restarting in $restart_delay seconds...${NC}"
+
+            # Wait before restarting
+            local countdown=$restart_delay
+            while [ $countdown -gt 0 ]; do
+                echo -n "Restarting in $countdown seconds... "
+                sleep 1
+                countdown=$((countdown - 1))
+                echo -ne "\r"
+            done
+            echo ""
+
+            # Try to restart
+            if ! start_bot; then
+                echo -e "${RED}Failed to restart bot. Will try again in next cycle.${NC}"
+            else
+                echo -e "${GREEN}Bot restarted successfully${NC}"
+            fi
+        fi
+    done
+}
+
 # Main script logic
 case "${1:-help}" in
     start)
@@ -135,6 +185,9 @@ case "${1:-help}" in
         ;;
     restart)
         restart_bot
+        ;;
+    monitor|auto-restart)
+        auto_restart_bot
         ;;
     status)
         status_bot
@@ -149,16 +202,23 @@ case "${1:-help}" in
     help|--help|-h)
         echo "Cline Telegram Bot Daemon Control Script"
         echo ""
-        echo "Usage: $0 {start|stop|restart|status|logs|tail|help}"
+        echo "Usage: $0 {start|stop|restart|monitor|status|logs|tail|help}"
         echo ""
         echo "Commands:"
-        echo "  start   - Start the bot as a background daemon"
-        echo "  stop    - Stop the running bot"
-        echo "  restart - Restart the bot"
-        echo "  status  - Check if bot is running"
-        echo "  logs    - Show last 50 lines of logs"
-        echo "  tail    - Follow log file in real-time"
-        echo "  help    - Show this help message"
+        echo "  start        - Start the bot as a background daemon"
+        echo "  stop         - Stop the running bot"
+        echo "  restart      - Restart the bot"
+        echo "  monitor      - Auto-restart bot if it crashes (Ctrl+C to stop)"
+        echo "  status       - Check if bot is running"
+        echo "  logs         - Show last 50 lines of logs"
+        echo "  tail         - Follow log file in real-time"
+        echo "  help         - Show this help message"
+        echo ""
+        echo "Auto-restart mode:"
+        echo "  - Monitors bot every 10 seconds"
+        echo "  - Automatically restarts if bot crashes"
+        echo "  - Limits to 10 restart attempts to prevent infinite loops"
+        echo "  - 30-second delay between restart attempts"
         echo ""
         echo "Files:"
         echo "  PID file: $PID_FILE"
