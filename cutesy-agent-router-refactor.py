@@ -27,6 +27,16 @@ import psutil
 from dotenv import load_dotenv
 from telegram.ext import Application, CommandHandler, MessageHandler, filters
 
+# Discord support (optional)
+try:
+    import discord
+    from discord.ext import commands
+    DISCORD_AVAILABLE = True
+except ImportError:
+    DISCORD_AVAILABLE = False
+    discord = None
+    commands = None
+
 
 # ============================================================================
 # LOGGING
@@ -644,11 +654,11 @@ class CodexAPIAgent(ACPAgent):
 # ============================================================================
 
 class AgentChatBridge:
-    """Bridges agent and Telegram"""
+    """Bridges agent and chat service (Telegram/Discord)"""
 
-    def __init__(self, agent: AgentInterface, app: Application, user_id: str):
+    def __init__(self, agent: AgentInterface, chat_service, user_id: str):
         self.agent = agent
-        self.app = app
+        self.chat_service = chat_service
         self.user_id = user_id
         self.output_monitor_task = None
         self._recent_hashes = deque(maxlen=10)  # For duplicate filtering
@@ -674,7 +684,13 @@ class AgentChatBridge:
     async def send_message(self, user_id: str, text: str) -> None:
         """Send message to user"""
         try:
-            await self.app.bot.send_message(chat_id=int(user_id), text=text)
+            # Check if it's a Telegram Application (old interface) or ChatServiceInterface (new)
+            if hasattr(self.chat_service, 'run_polling'):
+                # Telegram Application - old interface
+                await self.chat_service.bot.send_message(chat_id=int(user_id), text=text)
+            else:
+                # ChatServiceInterface - new interface (Discord, etc.)
+                await self.chat_service.send_message(user_id, text)
         except Exception as e:
             debug_log(DEBUG_ERROR, f"Failed to send message: {e}")
 
@@ -1005,6 +1021,265 @@ class AgentChatBridge:
 
         return Message(output.type, clean_content, output.sender, output.metadata)
 
+    # Methods for new chat service interface (used by Discord)
+    async def process_message(self, message_text: str, sender_id: str):
+        """Process incoming message from chat service (for Discord)"""
+        if sender_id != self.user_id:
+            await self.chat_service.send_message(sender_id, "❌ Unauthorized")
+            return
+
+        message_text = message_text.strip()
+
+        # Handle commands vs regular messages
+        if message_text.startswith("/"):
+            await self.handle_command_from_chat(message_text, sender_id)
+        else:
+            await self.handle_regular_message_from_chat(message_text, sender_id)
+
+    async def handle_command_from_chat(self, message_text: str, sender_id: str):
+        """Handle commands from chat service (simplified version)"""
+        parts = message_text.split(maxsplit=1)
+        cmd = parts[0]
+        args = parts[1] if len(parts) > 1 else ""
+
+        # Handle built-in commands
+        if cmd == "/start":
+            if self.agent.is_running():
+                await self.chat_service.send_message(sender_id, "ℹ️ Agent already running")
+                return
+
+            if await self.agent.start():
+                startup_msg = f"✅ {self.agent.name} session started\n\n{self._format_commands()}"
+                await self.chat_service.send_message(sender_id, startup_msg)
+                if not self.output_monitor_task:
+                    self.output_monitor_task = asyncio.create_task(self._output_monitor())
+            else:
+                await self.chat_service.send_message(sender_id, f"❌ Failed to start {self.agent.name}")
+
+        elif cmd == "/stop":
+            await self.agent.stop()
+            await self.chat_service.send_message(sender_id, "🛑 Agent stopped")
+
+        elif cmd == "/status":
+            status = "🟢 Running" if self.agent.is_running() else "🔴 Stopped"
+            waiting = "\n⏸️ Waiting for input" if self.agent.waiting_for_input else ""
+            await self.chat_service.send_message(sender_id, f"Status: {status}{waiting}\nAgent: {self.agent.name}")
+
+        elif cmd == "/help":
+            custom_help = await self.agent.get_custom_help()
+            help_text = f"""🤖 **Agent-Chat Bridge Help**
+
+**Getting Started:**
+• `/start` - Start a new {self.agent.name} session
+• `/stop` - Stop the current session
+• `/reset` - Reset agent state and start fresh
+
+**Commands:**
+• `/status` - Check bot and session status
+• `/cancel` - Cancel current operation
+
+**Available Commands:**
+{self._format_commands()}{custom_help}"""
+            await self.chat_service.send_message(sender_id, help_text)
+
+        elif cmd == "/cancel":
+            if not self.agent.is_running():
+                await self.chat_service.send_message(sender_id, f"❌ {self.agent.name} not running. Use /start")
+                return
+
+            cancel_result = await self._cancel_operation()
+            await self.chat_service.send_message(sender_id, cancel_result)
+
+        elif cmd == "/reset":
+            reset_result = await self._reset_agent()
+            await self.chat_service.send_message(sender_id, reset_result)
+
+        # Handle custom commands
+        elif cmd in self.custom_commands:
+            if not self.agent.is_running():
+                await self.chat_service.send_message(sender_id, f"❌ {self.agent.name} not running. Use /start")
+                return
+
+            response = await self.agent.handle_custom_command(cmd, args)
+            if response:
+                await self.chat_service.send_message(sender_id, response)
+            else:
+                # Send as regular command to agent
+                await self.agent.send_command(message_text)
+                await asyncio.sleep(1.0)
+                output = await self.agent.get_output()
+                if output:
+                    await self.chat_service.send_message(sender_id, output.content)
+
+        else:
+            available = self._format_commands()
+            await self.chat_service.send_message(sender_id,
+                f"❌ Unknown command: {cmd}\n\n**Available Commands:**\n{available}")
+
+    async def handle_regular_message_from_chat(self, message_text: str, sender_id: str):
+        """Handle regular messages from chat service"""
+        if not self.agent.is_running():
+            await self.chat_service.send_message(sender_id, f"❌ {self.agent.name} not running. Use /start")
+            return
+
+        # Security: Check message size
+        if len(message_text) > self._max_message_length:
+            await self.chat_service.send_message(sender_id, f"❌ Message too long (max {self._max_message_length} characters)")
+            return
+
+        # Security: Rate limiting
+        current_time = time.time()
+
+        # Periodic cleanup of stale rate limit entries (prevents memory leak)
+        if current_time - self._last_cleanup > self._rate_limit_cleanup_interval:
+            stale_users = [
+                uid for uid, ts in self._last_message_time.items()
+                if current_time - ts > 86400  # Older than 24 hours
+            ]
+            for uid in stale_users:
+                del self._last_message_time[uid]
+            self._last_cleanup = current_time
+            debug_log(DEBUG_INFO, f"Cleaned up {len(stale_users)} stale rate limit entries")
+
+        if sender_id in self._last_message_time:
+            time_diff = current_time - self._last_message_time[sender_id]
+            if time_diff < (self._rate_limit_ms / 1000):  # Convert ms to seconds
+                await self.chat_service.send_message(sender_id, "⏱️ Please wait before sending another message")
+                return
+
+        self._last_message_time[sender_id] = current_time
+
+        await self.chat_service.send_message(sender_id, f"📤 Message sent...")
+
+        await self.agent.send_command(message_text)
+
+        try:
+            # Wait for output with agent-specific timeout
+            timeout_seconds = getattr(self.agent, 'command_timeout', 30.0)
+            output = await asyncio.wait_for(
+                self.agent.get_output(),
+                timeout=timeout_seconds
+            )
+        except asyncio.TimeoutError:
+            timeout_seconds = getattr(self.agent, 'command_timeout', 30.0)
+            await self.chat_service.send_message(sender_id,
+                f"⏱️ Response timeout (>{timeout_seconds}s)\n\n"
+                "Command is still running in background.\n"
+                "Output will arrive via continuous monitoring."
+            )
+            return
+
+        if output:
+            await self.chat_service.send_message(sender_id, output.content)
+
+
+# ============================================================================
+# CHAT SERVICES
+# ============================================================================
+
+class ChatServiceInterface(ABC):
+    """Abstract interface for chat services (Telegram, Discord, etc.)"""
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+
+    @abstractmethod
+    def set_message_handler(self, handler: Callable) -> None:
+        """Set handler for incoming messages"""
+        pass
+
+    @abstractmethod
+    async def send_message(self, user_id: str, text: str) -> None:
+        """Send message to user"""
+        pass
+
+    @abstractmethod
+    async def start(self) -> None:
+        """Start the chat service"""
+        pass
+
+    @abstractmethod
+    async def stop(self) -> None:
+        """Stop the chat service"""
+        pass
+
+
+if DISCORD_AVAILABLE:
+    class DiscordChatService(ChatServiceInterface):
+        """Discord chat service"""
+
+        def __init__(self, config: Dict[str, Any]):
+            super().__init__(config)
+            self.token = config.get("token")
+            self.channel_id = config.get("channel_id")
+            self.authorized_user_id = config.get("authorized_user_id")
+            self.bot = None
+            self.message_handler = None
+
+        def set_message_handler(self, handler: Callable) -> None:
+            """Set handler for incoming messages"""
+            self.message_handler = handler
+
+        async def send_message(self, user_id: str, text: str) -> None:
+            """Send message to Discord user or channel"""
+            try:
+                if self.channel_id:
+                    # Send to specific channel
+                    channel = self.bot.get_channel(int(self.channel_id))
+                    if channel:
+                        await channel.send(text)
+                else:
+                    # DM the user
+                    user = await self.bot.fetch_user(int(user_id))
+                    await user.send(text)
+            except Exception as e:
+                debug_log(DEBUG_ERROR, f"Failed to send Discord message: {e}")
+
+        async def start(self) -> None:
+            """Start Discord bot"""
+            self.bot = commands.Bot(command_prefix="/", intents=discord.Intents.default())
+
+            @self.bot.event
+            async def on_ready():
+                debug_log(DEBUG_INFO, f"Discord bot logged in as {self.bot.user}")
+
+            @self.bot.event
+            async def on_message(message):
+                # Ignore bot's own messages
+                if message.author == self.bot.user:
+                    return
+
+                # Check authorization
+                if str(message.author.id) != self.authorized_user_id:
+                    await message.reply("❌ Unauthorized")
+                    return
+
+                # Handle commands and messages
+                if message.content.startswith("/"):
+                    cmd = message.content
+                    if self.message_handler:
+                        await self.message_handler(cmd, str(message.author.id))
+                else:
+                    if self.message_handler:
+                        await self.message_handler(message.content, str(message.author.id))
+
+            await self.bot.start(self.token)
+
+        async def stop(self) -> None:
+            """Stop Discord bot"""
+            if self.bot:
+                await self.bot.close()
+else:
+    class DiscordChatService(ChatServiceInterface):
+        """Discord placeholder when discord.py not available"""
+        def __init__(self, config):
+            raise ImportError("discord.py not installed. Run: pip install discord.py")
+
+        def set_message_handler(self, handler): pass
+        async def send_message(self, user_id, text): pass
+        async def start(self): pass
+        async def stop(self): pass
+
 
 # ============================================================================
 # MAIN
@@ -1036,7 +1311,26 @@ def main():
     """Main entry point"""
     debug_log(DEBUG_INFO, "Starting Agent-Chat Bridge")
 
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    # Choose chat service
+    chat_service_type = os.getenv("CHAT_SERVICE", "telegram").lower()
+
+    if chat_service_type == "telegram":
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        if not token:
+            debug_log(DEBUG_ERROR, "TELEGRAM_BOT_TOKEN required for Telegram service")
+            return
+    elif chat_service_type == "discord":
+        token = os.getenv("DISCORD_BOT_TOKEN")
+        if not token:
+            debug_log(DEBUG_ERROR, "DISCORD_BOT_TOKEN required for Discord service")
+            return
+        if not DISCORD_AVAILABLE:
+            debug_log(DEBUG_ERROR, "Discord service requested but discord.py not installed. Run: pip install discord.py")
+            return
+    else:
+        debug_log(DEBUG_ERROR, f"Unknown chat service: {chat_service_type}. Use 'telegram' or 'discord'")
+        return
+
     user_id = os.getenv("AUTHORIZED_USER_ID")
     agent_type = os.getenv("AGENT_TYPE", "cline")
 
@@ -1089,46 +1383,62 @@ def main():
 
     agent = create_agent(agent_type, agent_config[agent_type])
 
-    # Initialize Telegram application
-    application = Application.builder().token(token).build()
+    if chat_service_type == "telegram":
+        # Original Telegram implementation
+        application = Application.builder().token(token).build()
+        bridge = AgentChatBridge(agent, application, user_id)
 
-    # Create bridge
-    bridge = AgentChatBridge(agent, application, user_id)
+        # Add handlers - built-in commands only (custom commands handled via messages)
+        application.add_handler(CommandHandler(["start", "stop", "status", "help", "cancel", "reset"], bridge.handle_command))
 
-    # Add handlers - built-in commands only (custom commands handled via messages)
-    application.add_handler(CommandHandler(["start", "stop", "status", "help", "cancel", "reset"], bridge.handle_command))
+        # Handle all text messages (including custom commands)
+        application.add_handler(MessageHandler(filters.TEXT, bridge.handle_all_text))
 
-    # Handle all text messages (including custom commands)
-    application.add_handler(MessageHandler(filters.TEXT, bridge.handle_all_text))
+        # Startup message and bridge initialization
+        async def post_init(app):
+            try:
+                # Initialize bridge asynchronously
+                await bridge.initialize()
 
-    # Startup message and bridge initialization
-    async def post_init(app):
-        try:
-            # Initialize bridge asynchronously
-            await bridge.initialize()
+                # Send startup message
+                await app.bot.send_message(
+                    chat_id=int(user_id),
+                    text=f"🤖 **Agent-Chat Bridge Started**\n\nAgent: {agent.name}\nUse /start to begin"
+                )
+                debug_log(DEBUG_INFO, "Startup message sent")
+            except Exception as e:
+                debug_log(DEBUG_ERROR, f"Failed to send startup message: {e}")
 
-            # Send startup message
-            await app.bot.send_message(
-                chat_id=int(user_id),
-                text=f"🤖 **Agent-Chat Bridge Started**\n\nAgent: {agent.name}\nUse /start to begin"
-            )
-            debug_log(DEBUG_INFO, "Startup message sent")
-        except Exception as e:
-            debug_log(DEBUG_ERROR, f"Failed to send startup message: {e}")
+        application.post_init = post_init
 
-    application.post_init = post_init
+        debug_log(DEBUG_INFO, f"Starting with {agent.name} ({agent_type}) on Telegram")
+        application.run_polling()
 
-    # Signal handling
-    def signal_handler(signum, frame):
-        debug_log(DEBUG_INFO, f"Received signal {signum}, shutting down")
-        import sys
-        sys.exit(0)
+    elif chat_service_type == "discord":
+        # Discord implementation
+        chat_config = {
+            "token": token,
+            "authorized_user_id": user_id,
+            "channel_id": os.getenv("DISCORD_CHANNEL_ID"),  # Optional
+        }
+        chat_service = DiscordChatService(chat_config)
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+        # Create bridge with chat service
+        bridge = AgentChatBridge(agent, chat_service, user_id)
 
-    debug_log(DEBUG_INFO, f"Starting with {agent.name} ({agent_type})")
-    application.run_polling()
+        # Initialize custom commands
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(bridge.initialize())
+
+        # Set up message routing
+        async def message_handler(message_text: str, sender_id: str):
+            await bridge.process_message(message_text, sender_id)
+
+        chat_service.set_message_handler(message_handler)
+
+        debug_log(DEBUG_INFO, f"Starting with {agent.name} ({agent_type}) on Discord")
+        asyncio.run(chat_service.start())
 
 
 if __name__ == "__main__":
