@@ -374,10 +374,24 @@ class ClineAgent(PTYAgent):
     async def get_custom_help(self) -> str:
         """Cline-specific help content"""
         return """
-**Usage:**
-• Send natural language queries to Cline
-• Send shell commands: `"git status"`, `"ls -la"`, `"pwd"`
-• Cline will execute commands in your project directory
+
+**Cline Mode Switching:**
+• `/plan` - Enable plan mode (Cline thinks before acting)
+• `/act` - Enable act mode (Cline executes immediately)
+
+**Usage Examples:**
+• "Show me all Python files in this directory"
+• "Create a README.md with project description"
+• "Fix any syntax errors in src/main.py"
+• "What's the current git status?"
+
+**Tips:**
+• Cline works best with clear, specific instructions
+• Use full context: "In the api/ directory, create..."
+• Chain requests: "First check git status, then commit my changes"
+• Send shell commands directly: `git status`, `ls -la`, `pwd`
+
+**Cline will execute commands in your project directory**
 """
 
     async def handle_custom_command(self, command: str, args: str) -> Optional[str]:
@@ -644,10 +658,20 @@ class AgentChatBridge:
         self._recent_hashes = deque(maxlen=10)  # For duplicate filtering
         self.custom_commands = {}  # Store custom commands
 
+        # Security: Rate limiting and size limits
+        self._last_message_time = {}  # user_id -> timestamp
+        self._rate_limit_ms = 500  # Minimum 500ms between messages
+        self._max_message_length = 10000  # Max 10,000 characters
+
     async def initialize(self) -> None:
         """Initialize bridge - get custom commands from agent"""
         self.custom_commands = await self.agent.get_custom_commands()
-        debug_log(DEBUG_INFO, f"Loaded custom commands: {list(self.custom_commands.keys())}")
+        custom_count = len(self.custom_commands)
+        debug_log(DEBUG_INFO,
+            f"Loaded custom commands for {self.agent.name}",
+            count=custom_count,
+            commands=list(self.custom_commands.keys())
+        )
 
     async def send_message(self, user_id: str, text: str) -> None:
         """Send message to user"""
@@ -763,9 +787,11 @@ class AgentChatBridge:
     async def _cancel_operation(self) -> str:
         """Cancel current operation - implementation varies by agent type"""
         # For PTY agents (like Cline), send Ctrl+C
-        if hasattr(self.agent, 'command'):
+        if isinstance(self.agent, PTYAgent):
             with self.agent.command_lock:
                 try:
+                    if not self.agent.is_running_flag:
+                        return "❌ Agent not running"
                     # Send Ctrl+C (0x03) directly to PTY
                     bytes_written = os.write(self.agent.master_fd, b"\x03")
                     debug_log(DEBUG_INFO, "Ctrl+C sent to PTY", bytes_written=bytes_written)
@@ -843,6 +869,23 @@ class AgentChatBridge:
         if not self.agent.is_running():
             await update.message.reply_text(f"❌ {self.agent.name} not running. Use /start")
             return
+
+        # Security: Check message size
+        if len(message_text) > self._max_message_length:
+            await update.message.reply_text(f"❌ Message too long (max {self._max_message_length} characters)")
+            return
+
+        # Security: Rate limiting
+        user_id = str(update.effective_user.id)
+        current_time = time.time()
+
+        if user_id in self._last_message_time:
+            time_diff = current_time - self._last_message_time[user_id]
+            if time_diff < (self._rate_limit_ms / 1000):  # Convert ms to seconds
+                await update.message.reply_text("⏱️ Please wait before sending another message")
+                return
+
+        self._last_message_time[user_id] = current_time
 
         await update.message.reply_text(f"📤 Message sent...")
 
@@ -990,20 +1033,19 @@ def main():
     # Create bridge
     bridge = AgentChatBridge(agent, application, user_id)
 
-    # Initialize custom commands (async operation)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(bridge.initialize())
-
     # Add handlers - built-in commands only (custom commands handled via messages)
     application.add_handler(CommandHandler(["start", "stop", "status", "help"], bridge.handle_command))
 
     # Handle all text messages (including custom commands)
     application.add_handler(MessageHandler(filters.TEXT, bridge.handle_all_text))
 
-    # Startup message
+    # Startup message and bridge initialization
     async def post_init(app):
         try:
+            # Initialize bridge asynchronously
+            await bridge.initialize()
+
+            # Send startup message
             await app.bot.send_message(
                 chat_id=int(user_id),
                 text=f"🤖 **Agent-Chat Bridge Started**\n\nAgent: {agent.name}\nUse /start to begin"
