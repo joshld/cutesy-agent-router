@@ -719,8 +719,8 @@ class AgentChatBridge:
             help_text = f"""🤖 **Agent-Chat Bridge Help**
 
 **Getting Started:**
-• `/start` - Start a new {self.agent.name} session
 • `/stop` - Stop the current session
+• `/start` - Start a new {self.agent.name} session
 • `/reset` - Reset agent state and start fresh
 
 **Commands:**
