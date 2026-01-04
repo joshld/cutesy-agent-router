@@ -825,6 +825,10 @@ class AgentChatBridge:
                     await self.agent.stop()
                     await asyncio.sleep(1.0)  # Longer pause for cleanup
 
+                # Clear duplicate message cache to allow fresh welcome messages
+                debug_log(DEBUG_INFO, "Clearing duplicate message cache")
+                self._recent_hashes.clear()
+
                 # Force cleanup even if agent thinks it's not running
                 debug_log(DEBUG_INFO, "Ensuring session clean before restart")
                 if hasattr(self.agent, '_ensure_session_clean'):
@@ -837,7 +841,7 @@ class AgentChatBridge:
                     debug_log(DEBUG_INFO, "Restarting output monitor")
                     self.output_monitor_task = asyncio.create_task(self._output_monitor())
                     debug_log(DEBUG_INFO, "Agent reset successful")
-                    return "🔄 **Agent Reset Complete**\n\n✅ Fresh session started\n✅ All state cleared\n✅ Output monitoring restarted\n✅ Ready for new commands"
+                    return "🔄 **Agent Reset Complete**\n\n✅ Fresh session started\n✅ All state cleared\n✅ Duplicate cache cleared\n✅ Output monitoring restarted\n✅ Ready for new commands"
                 else:
                     debug_log(DEBUG_ERROR, "Failed to start agent after reset")
                     return "❌ Reset failed - could not start new session"
