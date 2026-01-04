@@ -374,11 +374,6 @@ class ClineAgent(PTYAgent):
     async def get_custom_help(self) -> str:
         """Cline-specific help content"""
         return """
-
-**Cline Mode Switching:**
-• `/plan` - Enable plan mode (Cline thinks before acting)
-• `/act` - Enable act mode (Cline executes immediately)
-
 **Usage Examples:**
 • "Show me all Python files in this directory"
 • "Create a README.md with project description"
@@ -807,18 +802,48 @@ class AgentChatBridge:
 
     async def _reset_agent(self) -> str:
         """Reset agent - behavior depends on agent type"""
-        # For PTY agents (like Cline), restart the entire session
-        if hasattr(self.agent, 'command'):
-            was_running = self.agent.is_running()
-            if was_running:
-                await self.agent.stop()
-                await asyncio.sleep(0.5)  # Brief pause for cleanup
+        debug_log(DEBUG_INFO, f"Resetting agent: {self.agent.name}")
 
-            # Start fresh session
-            if await self.agent.start():
-                return "🔄 **Agent Reset Complete**\n\n✅ Fresh session started\n✅ All state cleared\n✅ Ready for new commands"
-            else:
-                return "❌ Reset failed - could not start new session"
+        # For PTY agents (like Cline), restart the entire session
+        if isinstance(self.agent, PTYAgent):
+            try:
+                # Stop the current output monitor if running
+                if self.output_monitor_task and not self.output_monitor_task.done():
+                    debug_log(DEBUG_INFO, "Cancelling output monitor task")
+                    self.output_monitor_task.cancel()
+                    try:
+                        await self.output_monitor_task
+                    except asyncio.CancelledError:
+                        debug_log(DEBUG_INFO, "Output monitor task cancelled")
+                    self.output_monitor_task = None
+
+                was_running = self.agent.is_running()
+                debug_log(DEBUG_INFO, f"Agent was running: {was_running}")
+
+                if was_running:
+                    debug_log(DEBUG_INFO, "Stopping agent")
+                    await self.agent.stop()
+                    await asyncio.sleep(1.0)  # Longer pause for cleanup
+
+                # Force cleanup even if agent thinks it's not running
+                debug_log(DEBUG_INFO, "Ensuring session clean before restart")
+                if hasattr(self.agent, '_ensure_session_clean'):
+                    self.agent._ensure_session_clean()
+
+                debug_log(DEBUG_INFO, "Starting fresh session")
+                # Start fresh session
+                if await self.agent.start():
+                    # Restart the output monitor
+                    debug_log(DEBUG_INFO, "Restarting output monitor")
+                    self.output_monitor_task = asyncio.create_task(self._output_monitor())
+                    debug_log(DEBUG_INFO, "Agent reset successful")
+                    return "🔄 **Agent Reset Complete**\n\n✅ Fresh session started\n✅ All state cleared\n✅ Output monitoring restarted\n✅ Ready for new commands"
+                else:
+                    debug_log(DEBUG_ERROR, "Failed to start agent after reset")
+                    return "❌ Reset failed - could not start new session"
+            except Exception as e:
+                debug_log(DEBUG_ERROR, f"Exception during agent reset: {e}")
+                return f"❌ Reset failed with error: {e}"
         else:
             # For API agents, clear conversation history and reset state
             if hasattr(self.agent, 'conversation_history'):
@@ -1034,7 +1059,7 @@ def main():
     bridge = AgentChatBridge(agent, application, user_id)
 
     # Add handlers - built-in commands only (custom commands handled via messages)
-    application.add_handler(CommandHandler(["start", "stop", "status", "help"], bridge.handle_command))
+    application.add_handler(CommandHandler(["start", "stop", "status", "help", "cancel", "reset"], bridge.handle_command))
 
     # Handle all text messages (including custom commands)
     application.add_handler(MessageHandler(filters.TEXT, bridge.handle_all_text))
