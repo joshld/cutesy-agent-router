@@ -110,6 +110,27 @@ class AgentInterface(ABC):
     def is_running(self) -> bool:
         return self.is_running_flag
 
+    async def get_custom_commands(self) -> Dict[str, str]:
+        """Return custom commands this agent supports
+
+        Returns:
+            Dict[command_name, description]
+            Example: {"/plan": "Switch to plan mode", "/act": "Switch to act mode"}
+        """
+        return {}
+
+    async def handle_custom_command(self, command: str, args: str) -> Optional[str]:
+        """Handle a custom command
+
+        Args:
+            command: The command name (e.g., "/plan")
+            args: Any arguments after the command
+
+        Returns:
+            Response message, or None to use default handling
+        """
+        return None
+
 
 # ============================================================================
 # PTY-BASED AGENTS (Cline, Codex CLI, etc)
@@ -334,6 +355,59 @@ class ClineAgent(PTYAgent):
             debug_log(DEBUG_DEBUG, f"Filtered Cline message: UI score {ui_score}, ratio {ui_ratio:.2f}, mostly_ui: {is_mostly_ui}")
 
         return should_filter
+
+    async def get_custom_commands(self) -> Dict[str, str]:
+        """Cline-specific commands (user-friendly names)"""
+        return {
+            "/plan": "Switch to plan mode - Cline will plan before executing",
+            "/act": "Switch to act mode - Cline will execute immediately",
+            "/clear": "Clear conversation history and start fresh",
+            "/undo": "Undo the last action",
+            "/diff": "Show diff of last changes",
+        }
+
+    async def handle_custom_command(self, command: str, args: str) -> Optional[str]:
+        """Handle Cline-specific commands"""
+
+        if command == "/plan":
+            # Send the plan command to Cline
+            result = await self.send_command("/plan")
+            await asyncio.sleep(0.5)
+            output = await self.get_output()
+            response = f"📋 Switched to Plan Mode\n{result}"
+            if output:
+                response += f"\n{output.content}"
+            return response
+
+        elif command == "/act":
+            # Send the act command to Cline
+            result = await self.send_command("/act")
+            await asyncio.sleep(0.5)
+            output = await self.get_output()
+            response = f"⚡ Switched to Act Mode\n{result}"
+            if output:
+                response += f"\n{output.content}"
+            return response
+
+        elif command == "/clear":
+            # Clear conversation history
+            # For PTY agents, we restart the process
+            await self.stop()
+            await self.start()
+            return "🔄 Agent restarted and conversation cleared"
+
+        elif command == "/undo":
+            # Cline may support undo
+            result = await self.send_command("undo")
+            return f"↩️ Undo executed\n{result}"
+
+        elif command == "/diff":
+            # Show recent changes
+            result = await self.send_command("diff")
+            return f"📝 Recent changes:\n{result}"
+
+        else:
+            return None  # Use default handling
 
 
 class CodexCLIAgent(PTYAgent):
@@ -571,6 +645,12 @@ class AgentChatBridge:
         self.user_id = user_id
         self.output_monitor_task = None
         self._recent_hashes = deque(maxlen=10)  # For duplicate filtering
+        self.custom_commands = {}  # Store custom commands
+
+    async def initialize(self) -> None:
+        """Initialize bridge - get custom commands from agent"""
+        self.custom_commands = await self.agent.get_custom_commands()
+        debug_log(DEBUG_INFO, f"Loaded custom commands: {list(self.custom_commands.keys())}")
 
     async def send_message(self, user_id: str, text: str) -> None:
         """Send message to user"""
@@ -580,13 +660,19 @@ class AgentChatBridge:
             debug_log(DEBUG_ERROR, f"Failed to send message: {e}")
 
     async def handle_command(self, update, context):
-        """Handle /start, /stop, /status commands"""
+        """Handle commands - both built-in and custom"""
         if update.effective_user.id != int(self.user_id):
             await update.message.reply_text("❌ Unauthorized")
             return
 
-        cmd = update.message.text
+        cmd_text = update.message.text
 
+        # Parse command and arguments
+        parts = cmd_text.split(maxsplit=1)
+        cmd = parts[0]
+        args = parts[1] if len(parts) > 1 else ""
+
+        # Handle built-in commands
         if cmd == "/start":
             if self.agent.is_running():
                 await update.message.reply_text("ℹ️ Agent already running")
@@ -595,9 +681,7 @@ class AgentChatBridge:
             if await self.agent.start():
                 await update.message.reply_text(
                     f"✅ {self.agent.name} started\n\n"
-                    "Send messages to interact with the agent\n"
-                    "• `/stop` - Stop agent\n"
-                    "• `/status` - Check status"
+                    f"Available commands:\n{self._format_commands()}"
                 )
                 if not self.output_monitor_task:
                     self.output_monitor_task = asyncio.create_task(self._output_monitor())
@@ -613,23 +697,86 @@ class AgentChatBridge:
             waiting = "\n⏸️ Waiting for input" if self.agent.waiting_for_input else ""
             await update.message.reply_text(f"Status: {status}{waiting}\nAgent: {self.agent.name}")
 
-    async def handle_message(self, update, context):
-        """Handle regular messages"""
+        elif cmd == "/help":
+            await update.message.reply_text(f"Available commands:\n{self._format_commands()}")
+
+        # Handle custom commands
+        elif cmd in self.custom_commands:
+            if not self.agent.is_running():
+                await update.message.reply_text(f"❌ Agent not running. Use /start")
+                return
+
+            # Let agent handle the custom command
+            response = await self.agent.handle_custom_command(cmd, args)
+
+            if response:
+                # Custom command returned a response
+                await update.message.reply_text(response)
+            else:
+                # Agent returned None, use default handling
+                await self.agent.send_command(cmd_text)
+                await asyncio.sleep(1.0)
+                output = await self.agent.get_output()
+                if output:
+                    await update.message.reply_text(output.content)
+
+        # Handle unknown commands
+        else:
+            available = self._format_commands()
+            await update.message.reply_text(
+                f"❌ Unknown command: {cmd}\n\n"
+                f"Available commands:\n{available}"
+            )
+
+    async def handle_all_text(self, update, context):
+        """Handle all text messages (commands and regular messages)"""
         if update.effective_user.id != int(self.user_id):
             await update.message.reply_text("❌ Unauthorized")
             return
 
+        message_text = update.message.text.strip()
+
+        # Check if it's a custom command (starts with / and is in custom commands)
+        if message_text.startswith("/") and message_text.split()[0] in self.custom_commands:
+            await self.handle_custom_command_message(update, message_text)
+        else:
+            await self.handle_regular_message(update, message_text)
+
+    async def handle_custom_command_message(self, update, message_text):
+        """Handle custom command messages"""
         if not self.agent.is_running():
             await update.message.reply_text(f"❌ {self.agent.name} not running. Use /start")
             return
 
-        message_text = update.message.text.strip()
-        
+        # Parse command and args
+        parts = message_text.split(maxsplit=1)
+        cmd = parts[0]
+        args = parts[1] if len(parts) > 1 else ""
+
+        # Handle the custom command
+        response = await self.agent.handle_custom_command(cmd, args)
+
+        if response:
+            await update.message.reply_text(response)
+        else:
+            # Fallback: send as regular command
+            await self.agent.send_command(message_text)
+            await asyncio.sleep(1.0)
+            output = await self.agent.get_output()
+            if output:
+                await update.message.reply_text(output.content)
+
+    async def handle_regular_message(self, update, message_text):
+        """Handle regular (non-command) messages"""
+        if not self.agent.is_running():
+            await update.message.reply_text(f"❌ {self.agent.name} not running. Use /start")
+            return
+
         await update.message.reply_text(f"📤 Message sent...")
-        
+
         await self.agent.send_command(message_text)
         await asyncio.sleep(1.0)
-        
+
         output = await self.agent.get_output()
         if output:
             await update.message.reply_text(output.content)
@@ -652,6 +799,21 @@ class AgentChatBridge:
             except Exception as e:
                 debug_log(DEBUG_ERROR, f"Output monitor error: {e}")
                 await asyncio.sleep(2)
+
+    def _format_commands(self) -> str:
+        """Format available commands for display"""
+        commands_text = "**Built-in Commands:**\n"
+        commands_text += "• `/start` - Start agent\n"
+        commands_text += "• `/stop` - Stop agent\n"
+        commands_text += "• `/status` - Check status\n"
+        commands_text += "• `/help` - Show all commands\n"
+
+        if self.custom_commands:
+            commands_text += f"\n**{self.agent.name} Custom Commands:**\n"
+            for cmd, description in self.custom_commands.items():
+                commands_text += f"• `{cmd}` - {description}\n"
+
+        return commands_text
 
     def _filter_output(self, output: Message) -> Optional[Message]:
         """Apply sophisticated filtering to prevent duplicates and UI spam"""
@@ -761,9 +923,16 @@ def main():
     # Create bridge
     bridge = AgentChatBridge(agent, application, user_id)
 
-    # Add handlers
-    application.add_handler(CommandHandler(["start", "stop", "status"], bridge.handle_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bridge.handle_message))
+    # Initialize custom commands (async operation)
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(bridge.initialize())
+
+    # Add handlers - built-in commands only (custom commands handled via messages)
+    application.add_handler(CommandHandler(["start", "stop", "status", "help"], bridge.handle_command))
+
+    # Handle all text messages (including custom commands)
+    application.add_handler(MessageHandler(filters.TEXT, bridge.handle_all_text))
 
     # Startup message
     async def post_init(app):
